@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data pesada (se guarda en Drive, no en GitHub)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Modelos pesados
+models/*.h5
+models/*.pkl
+models/*.keras
+
+# OS
+.DS_Store
