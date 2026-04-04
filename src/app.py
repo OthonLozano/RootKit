@@ -17,6 +17,7 @@ Dependencias de modelos (ruta relativa desde src/):
 
 import os
 import pickle
+import cv2
 import numpy as np
 import streamlit as st
 from PIL import Image
@@ -42,7 +43,7 @@ st.set_page_config(
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR  = os.path.join(BASE_DIR, "..", "models")
 
-PATH_CNN        = os.path.join(MODELS_DIR, "cnn_v1.h5")
+PATH_CNN        = os.path.join(MODELS_DIR, "best_cnn_v1.h5")#cnn_v1.h5
 PATH_METADATA   = os.path.join(MODELS_DIR, "cnn_metadata.pkl")
 PATH_KMEANS     = os.path.join(MODELS_DIR, "clustering_kmeans.pkl")
 PATH_PCA        = os.path.join(MODELS_DIR, "clustering_pca.pkl")
@@ -137,8 +138,7 @@ def _construir_extractor(cnn):
             return x
 
     return ExtractorSecuencial(capas_internas)
-
-
+    
 @st.cache_resource(show_spinner="Cargando modelos — esto ocurre una sola vez...")
 def cargar_modelos():
     """
@@ -222,6 +222,59 @@ def preprocesar_imagen(
     return np.expand_dims(arr, axis=0)
 
 
+
+RANGOS_PLANTAS = {
+    'Tomato': {'hoja': ([5, 20, 20], [95, 255, 255]), 'sano': ([25, 25, 25], [95, 255, 255])},
+    'Potato': {'hoja': ([0, 10, 10], [90, 255, 255]), 'sano': ([38, 50, 50], [90, 255, 255])},
+    'Pepper': {'hoja': ([25, 30, 30], [95, 255, 255]), 'sano': ([35, 50, 50], [95, 255, 255])},
+    'default': {'hoja': ([0, 20, 20], [100, 255, 255]), 'sano': ([35, 40, 40], [90, 255, 255])}
+}
+
+def extraer_histograma_hsv(image_pil):
+    # Convertir de PIL a OpenCV (BGR)
+    img_cv = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
+    
+    # Rangos que usaste en tu Notebook para segmentar la hoja
+    bajo_hoja = np.array([30, 20, 20])
+    alto_hoja = np.array([90, 255, 255])
+    
+    # Crear máscara y extraer histograma de Hue (16 bins como en el notebook)
+    mascara_hoja = cv2.inRange(hsv, bajo_hoja, alto_hoja)
+    hist_hue = cv2.calcHist([hsv], [0], mascara_hoja, [16], [0, 180])
+    
+    # Normalizar para que coincida con el entrenamiento
+    cv2.normalize(hist_hue, hist_hue, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+    
+    return hist_hue.flatten().reshape(1, -1)
+
+
+def extraer_features_regresion(imagen_pil, nombre_clase):
+    # 1. Convertir de PIL a OpenCV
+    img_rgb = np.array(imagen_pil.convert("RGB"))
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    # 2. Obtener rangos según la planta (Usa el diccionario RANGOS_PLANTAS)
+    rango = RANGOS_PLANTAS.get(nombre_clase.split('_')[0], RANGOS_PLANTAS['default'])
+    lower_leaf = np.array(rango['hoja'][0])
+    upper_leaf = np.array(rango['hoja'][1])
+    
+    # 3. Crear máscara de la hoja
+    mask_leaf = cv2.inRange(hsv, lower_leaf, upper_leaf)
+    
+    # 4. Extraer solo el histograma de HUE (16 bins) - IGUAL QUE EL NOTEBOOK
+    hist_hue = cv2.calcHist([hsv], [0], mask_leaf, [16], [0, 180])
+    
+    # Normalizar
+    total = hist_hue.sum()
+    if total > 0:
+        hist_hue /= total
+        
+    return hist_hue.flatten().reshape(1, -1) # Retorna (1, 16)
+
+
+    
 
 def extraer_histograma_hsv(
     imagen_pil: Image.Image,
@@ -589,40 +642,37 @@ if pagina == "Diagnóstico":
             with tab_reg:
                 with st.spinner("Estimando severidad..."):
                     try:
-                        res_reg = inferir_regresion(
-                            imagen, scaler, pca, regresor
-                        )
-
-                        nivel, color = nivel_severidad(res_reg["porcentaje"])
-
+                        # 1. USAMOS LA ETIQUETA QUE DIO LA CLASIFICACIÓN (RES_CLF VIENE DEL TAB 1)
+                        clase_actual = res_clf["etiqueta"]
+            
+                        # 2. LLAMAMOS A TU NUEVA FUNCIÓN (LA QUE PUSISTE ARRIBA)
+                        # Esto genera 16 features. NO USAMOS NI SCALER NI PCA AQUÍ.
+                        features_hsv = extraer_features_regresion(imagen, clase_actual)
+            
+                        # 3. PREDICCIÓN DIRECTA CON TU MODELO .PKL
+                        # Como tu modelo espera 16 y le damos 16, ya no habrá error.
+                        porcentaje_predicho = regresor.predict(features_hsv)[0]
+            
+                        # 4. OBTENER NIVEL TEXTUAL (BAJO, ALTO, ETC.)
+                        nivel, color_str = nivel_severidad(porcentaje_predicho)
+            
+                        # 5. MOSTRAR RESULTADOS
                         st.metric(
                             label="Severidad estimada",
-                            value=f"{res_reg['porcentaje']} %",
+                            value=f"{porcentaje_predicho:.2f} %",
                             delta=f"Nivel: {nivel}",
                         )
-
-                        # Barra de progreso visual
-                        st.progress(
-                            res_reg["severidad"],
-                            text=f"Afectación: {res_reg['porcentaje']} %",
-                        )
-
-                        if color == "success":
-                            st.success(
-                                "Nivel de afectación bajo. "
-                                "Se recomienda monitoreo preventivo."
-                            )
-                        elif color == "warning":
-                            st.warning(
-                                "Nivel de afectación moderado. "
-                                "Aplicar tratamiento localizado."
-                            )
+            
+                        # Barra de progreso
+                        st.progress(min(porcentaje_predicho/100, 1.0), text=f"Afectación: {porcentaje_predicho:.1f}%")
+            
+                        if color_str == "success":
+                            st.success("Nivel bajo. Monitoreo preventivo.")
+                        elif color_str == "warning":
+                            st.warning("Nivel moderado. Aplicar tratamiento.")
                         else:
-                            st.error(
-                                "Nivel de afectación alto o crítico. "
-                                "Intervención inmediata recomendada."
-                            )
-
+                            st.error("Nivel crítico. Intervención inmediata.")
+            
                     except Exception as exc:
                         st.error(f"Error en regresión: {exc}")
 
