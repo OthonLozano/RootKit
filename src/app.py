@@ -42,7 +42,7 @@ st.set_page_config(
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR  = os.path.join(BASE_DIR, "..", "models")
 
-PATH_CNN        = os.path.join(MODELS_DIR, "cnn_v1.h5")
+PATH_CNN        = os.path.join(MODELS_DIR, "best_cnn_v1.h5")
 PATH_METADATA   = os.path.join(MODELS_DIR, "cnn_metadata.pkl")
 PATH_KMEANS     = os.path.join(MODELS_DIR, "clustering_kmeans.pkl")
 PATH_PCA        = os.path.join(MODELS_DIR, "clustering_pca.pkl")
