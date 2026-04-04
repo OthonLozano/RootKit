@@ -50,6 +50,8 @@ PATH_PCA        = os.path.join(MODELS_DIR, "clustering_pca.pkl")
 PATH_SCALER     = os.path.join(MODELS_DIR, "clustering_scaler.pkl")
 PATH_REGRESION  = os.path.join(MODELS_DIR, "regresion_severidad.pkl")
 
+ASSETS_DIR = os.path.join(BASE_DIR, "..", "assets", "cluster_samples")
+
 # Tamaño de entrada esperado por el CNN.
 # Valor por defecto; puede ser sobreescrito en tiempo de ejecución
 # una vez que cargar_modelos() determine el tamaño real del modelo.
@@ -484,20 +486,11 @@ def inferir_regresion(imagen_pil: Image.Image, scaler, pca, regresor) -> dict:
 # ---------------------------------------------------------------------------
 # Utilidades de presentación
 # ---------------------------------------------------------------------------
-ETIQUETAS_CLUSTER = {
-    0: "Patrón de lesión: manchas necróticas",
-    1: "Patrón de lesión: clorosis foliar",
-    2: "Patrón de lesión: micelio superficial",
-    3: "Patrón de lesión: decoloración vascular",
-    4: "Patrón de lesión: tejido sano",
-}
-
 def descripcion_cluster(cluster_id: int, n_clusters: int) -> str:
-    """Devuelve una descripción semántica del cluster asignado."""
-    return ETIQUETAS_CLUSTER.get(
-        cluster_id,
+    """Devuelve una descripción neutral del cluster asignado."""
+    return (
         f"Grupo visual {cluster_id + 1} de {n_clusters} "
-        "(patrón identificado por K-Means)",
+        "(patrón identificado por K-Means)"
     )
 
 
@@ -617,7 +610,7 @@ if pagina == "Diagnóstico":
 
                         st.metric(
                             label="Cluster asignado",
-                            value=f"Cluster {res_clu['cluster_id']}",
+                            value=f"Cluster {res_clu['cluster_id'] + 1}",
                         )
                         st.info(
                             descripcion_cluster(
@@ -626,12 +619,26 @@ if pagina == "Diagnóstico":
                             )
                         )
 
-                        st.caption(
-                            f"El modelo K-Means operó con {res_clu['n_clusters']} "
-                            f"grupos y PCA de {pca.n_components_} componentes. "
-                            "El cluster refleja el patrón visual predominante "
-                            "independientemente de la especie vegetal."
+                        # Imágenes representativas del cluster
+                        carpeta_cluster = os.path.join(
+                            ASSETS_DIR, f"cluster_{res_clu['cluster_id']}"
                         )
+                        if os.path.exists(carpeta_cluster):
+                            imagenes_similares = sorted(
+                                os.listdir(carpeta_cluster)
+                            )[:4]
+                            if imagenes_similares:
+                                st.markdown("**Imágenes similares del cluster**")
+                                cols = st.columns(4)
+                                for col, nombre_img in zip(cols, imagenes_similares):
+                                    ruta_img = os.path.join(
+                                        carpeta_cluster, nombre_img
+                                    )
+                                    col.image(
+                                        Image.open(ruta_img),
+                                        width="stretch",
+                                        caption="Caso similar",
+                                    )
 
                     except Exception as exc:
                         st.error(f"Error en agrupamiento: {exc}")
@@ -693,7 +700,7 @@ elif pagina == "Acerca del proyecto":
     ### Modelos implementados
     | Módulo | Algoritmo | Responsable | Artefacto |
     |---|---|---|---|
-    | Clasificación | CNN (MobileNetV2) | Carlos | `best_cnn_v2.h5` |
+    | Clasificación | CNN (MobileNetV2) | Carlos | `cnn_v1.h5` |
     | Agrupamiento | K-Means + PCA | Othon | `clustering_kmeans.pkl` |
     | Regresión de severidad | Regresión sobre features CNN | Max | `regresion_severidad.pkl` |
 
