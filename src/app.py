@@ -7,11 +7,12 @@ Descripción: Aplicación Streamlit con los tres modelos integrados:
              CNN (clasificación), K-Means (agrupamiento), Regresión (severidad).
 
 Dependencias de modelos (ruta relativa desde src/):
-    ../models/cnn_v1.h5
+    ../models/best_cnn_v1.h5
     ../models/cnn_metadata.pkl
     ../models/clustering_kmeans.pkl
     ../models/clustering_pca.pkl
     ../models/clustering_scaler.pkl
+    ../models/cluster_semantica.pkl
     ../models/regresion_severidad.pkl
 """
 
@@ -40,26 +41,21 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 # Rutas de artefactos
 # ---------------------------------------------------------------------------
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR  = os.path.join(BASE_DIR, "..", "models")
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "..", "models")
 
-PATH_CNN        = os.path.join(MODELS_DIR, "best_best_cnn_v1.h5")#cnn_v1.h5
-PATH_METADATA   = os.path.join(MODELS_DIR, "cnn_metadata.pkl")
-PATH_KMEANS     = os.path.join(MODELS_DIR, "clustering_kmeans.pkl")
-PATH_PCA        = os.path.join(MODELS_DIR, "clustering_pca.pkl")
-PATH_SCALER     = os.path.join(MODELS_DIR, "clustering_scaler.pkl")
-PATH_REGRESION  = os.path.join(MODELS_DIR, "regresion_severidad.pkl")
+PATH_CNN       = os.path.join(MODELS_DIR, "best_cnn_v1.h5")
+PATH_METADATA  = os.path.join(MODELS_DIR, "cnn_metadata.pkl")
+PATH_KMEANS    = os.path.join(MODELS_DIR, "clustering_kmeans.pkl")
+PATH_PCA       = os.path.join(MODELS_DIR, "clustering_pca.pkl")
+PATH_SCALER    = os.path.join(MODELS_DIR, "clustering_scaler.pkl")
+PATH_SEMANTICA = os.path.join(MODELS_DIR, "cluster_semantica.pkl")
+PATH_REGRESION = os.path.join(MODELS_DIR, "regresion_severidad.pkl")
 
 ASSETS_DIR = os.path.join(BASE_DIR, "..", "assets", "cluster_samples")
 
-# Tamaño de entrada esperado por el CNN.
-# Valor por defecto; puede ser sobreescrito en tiempo de ejecución
-# una vez que cargar_modelos() determine el tamaño real del modelo.
+# Tamaño de entrada por defecto; se sobreescribe en cargar_modelos()
 IMG_SIZE = (224, 224)
-
-# ---------------------------------------------------------------------------
-# Carga de modelos con caché (se ejecuta una sola vez por sesión)
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Funciones auxiliares para carga de modelos subclasificados
@@ -67,7 +63,7 @@ IMG_SIZE = (224, 224)
 
 def _inferir_input_size(cnn) -> tuple:
     """
-    Intenta determinar la forma de entrada (H, W) del modelo.
+    Determina la forma de entrada (H, W) del modelo.
 
     Estrategia 1: extraer batch_input_shape desde get_config().
     Estrategia 2: probar tamaños estándar con una pasada forward y
@@ -77,7 +73,6 @@ def _inferir_input_size(cnn) -> tuple:
     -------
     tuple (H, W)
     """
-    # Estrategia 1 — configuración serializada
     try:
         cfg = cnn.get_config()
         layers_cfg = cfg.get("layers", [])
@@ -89,7 +84,6 @@ def _inferir_input_size(cnn) -> tuple:
     except Exception:
         pass
 
-    # Estrategia 2 — búsqueda por prueba
     for size in [128, 64, 224, 32, 256]:
         try:
             _t = np.zeros((1, size, size, 3), dtype=np.float32)
@@ -98,7 +92,6 @@ def _inferir_input_size(cnn) -> tuple:
         except Exception:
             continue
 
-    # Fallback final
     return 128, 128
 
 
@@ -107,15 +100,10 @@ def _construir_extractor(cnn):
     Construye un extractor de características compatible con modelos
     subclasificados, Functional y Sequential.
 
-    Para modelos subclasificados, cnn.input no está definido, por lo que
-    Model(inputs=cnn.input, ...) no es viable. En su lugar se devuelve un
-    tf.keras.Model que ejecuta todas las capas del modelo base excepto la
-    última (capa de clasificación softmax).
-
-    Parameters
-    ----------
-    cnn : tf.keras.Model
-        Modelo completo previamente llamado al menos una vez (grafo trazado).
+    Para modelos subclasificados cnn.input no está definido, por lo que
+    Model(inputs=cnn.input, ...) no es viable. Se encapsula la extracción
+    en una clase que ejecuta cnn.layers[:-1] de forma secuencial,
+    omitiendo la capa de clasificación softmax final.
 
     Returns
     -------
@@ -130,9 +118,8 @@ def _construir_extractor(cnn):
             super().__init__(name="feature_extractor")
             self._capas_base = capas
 
-        def call(self, x, training=False):  # noqa: D401
+        def call(self, x, training=False):
             for capa in self._capas_base:
-                # Algunas capas aceptan training, otras no.
                 try:
                     x = capa(x, training=training)
                 except TypeError:
@@ -140,7 +127,12 @@ def _construir_extractor(cnn):
             return x
 
     return ExtractorSecuencial(capas_internas)
-    
+
+
+# ---------------------------------------------------------------------------
+# Carga de modelos con caché (se ejecuta una sola vez por sesión)
+# ---------------------------------------------------------------------------
+
 @st.cache_resource(show_spinner="Cargando modelos — esto ocurre una sola vez...")
 def cargar_modelos():
     """
@@ -149,134 +141,66 @@ def cargar_modelos():
     Returns
     -------
     tuple
-        (cnn_completo, extractor_features, metadata, kmeans, pca, scaler, regresor)
+        (cnn, extractor, metadata, kmeans, pca, scaler, regresor,
+         cluster_semantica)
     """
     # --- CNN ---
     cnn = load_model(PATH_CNN)
 
-    # -------------------------------------------------------------------------
-    # Determinar la forma de entrada real del modelo.
-    #
-    # El modelo es de tipo subclasificado (CNN_PlantVillage_v1), por lo que
-    # cnn.input no existe como atributo. Se infiere la forma de entrada desde
-    # la configuración serializada del modelo; si no está disponible se prueban
-    # tamaños estándar hasta encontrar el que no produce error de forma.
-    # -------------------------------------------------------------------------
     _input_h, _input_w = _inferir_input_size(cnn)
-
-    # Materializar el grafo con una pasada forward sobre el tensor de entrada
-    # del tamaño correcto.
     _dummy = np.zeros((1, _input_h, _input_w, 3), dtype=np.float32)
     cnn(_dummy, training=False)
 
-    # -------------------------------------------------------------------------
-    # Extractor de características para modelos subclasificados.
-    #
-    # Model(inputs=cnn.input, ...) es incompatible con modelos subclasificados
-    # porque cnn.input nunca se define en esa arquitectura.
-    #
-    # Se encapsula la extracción en una función que ejecuta cnn.layers[:-1]
-    # de forma secuencial, omitiendo la capa de clasificación final.
-    # -------------------------------------------------------------------------
     extractor = _construir_extractor(cnn)
     extractor._rootkit_input_hw = (_input_h, _input_w)
 
-    # --- Metadata del CNN (nombres de clases, índice → etiqueta) ---
+    # --- Metadata CNN ---
     with open(PATH_METADATA, "rb") as f:
         metadata = pickle.load(f)
 
     # --- Artefactos de clustering ---
-    with open(PATH_KMEANS,  "rb") as f: kmeans  = pickle.load(f)
-    with open(PATH_PCA,     "rb") as f: pca     = pickle.load(f)
-    with open(PATH_SCALER,  "rb") as f: scaler  = pickle.load(f)
+    with open(PATH_KMEANS,    "rb") as f: kmeans            = pickle.load(f)
+    with open(PATH_PCA,       "rb") as f: pca               = pickle.load(f)
+    with open(PATH_SCALER,    "rb") as f: scaler            = pickle.load(f)
+    with open(PATH_SEMANTICA, "rb") as f: cluster_semantica = pickle.load(f)
 
     # --- Modelo de regresión ---
     with open(PATH_REGRESION, "rb") as f: regresor = pickle.load(f)
 
-    return cnn, extractor, metadata, kmeans, pca, scaler, regresor
+    return cnn, extractor, metadata, kmeans, pca, scaler, regresor, cluster_semantica
 
 
 # ---------------------------------------------------------------------------
 # Preprocesamiento de imagen
 # ---------------------------------------------------------------------------
+
 def preprocesar_imagen(
     imagen_pil: Image.Image,
-    img_size: tuple[int, int] = IMG_SIZE,
+    img_size: tuple = IMG_SIZE,
 ) -> np.ndarray:
     """
     Redimensiona y normaliza una imagen PIL para inferencia CNN.
 
-    Parameters
-    ----------
-    imagen_pil : PIL.Image.Image
-        Imagen cargada por el usuario (RGB).
-    img_size : tuple[int, int]
-        Tamaño (H, W) al que se redimensiona la imagen. Por defecto IMG_SIZE;
-        se sobreescribe con el tamaño real del modelo una vez cargado.
-
     Returns
     -------
-    np.ndarray
-        Tensor de forma (1, H, W, 3) con valores en [0, 1].
+    np.ndarray de forma (1, H, W, 3) con valores en [0, 1].
     """
-    img = imagen_pil.resize((img_size[1], img_size[0]))   # PIL: (W, H)
+    img = imagen_pil.resize((img_size[1], img_size[0]))  # PIL recibe (W, H)
     arr = np.array(img, dtype=np.float32) / 255.0
     return np.expand_dims(arr, axis=0)
 
 
+# ---------------------------------------------------------------------------
+# Extracción de features HSV
+# ---------------------------------------------------------------------------
 
 RANGOS_PLANTAS = {
-    'Tomato': {'hoja': ([5, 20, 20], [95, 255, 255]), 'sano': ([25, 25, 25], [95, 255, 255])},
-    'Potato': {'hoja': ([0, 10, 10], [90, 255, 255]), 'sano': ([38, 50, 50], [90, 255, 255])},
-    'Pepper': {'hoja': ([25, 30, 30], [95, 255, 255]), 'sano': ([35, 50, 50], [95, 255, 255])},
-    'default': {'hoja': ([0, 20, 20], [100, 255, 255]), 'sano': ([35, 40, 40], [90, 255, 255])}
+    'Tomato':  {'hoja': ([5,  20, 20], [95, 255, 255])},
+    'Potato':  {'hoja': ([0,  10, 10], [90, 255, 255])},
+    'Pepper':  {'hoja': ([25, 30, 30], [95, 255, 255])},
+    'default': {'hoja': ([0,  20, 20], [100, 255, 255])},
 }
 
-def extraer_histograma_hsv(image_pil):
-    # Convertir de PIL a OpenCV (BGR)
-    img_cv = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
-    hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
-    
-    # Rangos que usaste en tu Notebook para segmentar la hoja
-    bajo_hoja = np.array([30, 20, 20])
-    alto_hoja = np.array([90, 255, 255])
-    
-    # Crear máscara y extraer histograma de Hue (16 bins como en el notebook)
-    mascara_hoja = cv2.inRange(hsv, bajo_hoja, alto_hoja)
-    hist_hue = cv2.calcHist([hsv], [0], mascara_hoja, [16], [0, 180])
-    
-    # Normalizar para que coincida con el entrenamiento
-    cv2.normalize(hist_hue, hist_hue, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
-    
-    return hist_hue.flatten().reshape(1, -1)
-
-
-def extraer_features_regresion(imagen_pil, nombre_clase):
-    # 1. Convertir de PIL a OpenCV
-    img_rgb = np.array(imagen_pil.convert("RGB"))
-    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-
-    # 2. Obtener rangos según la planta (Usa el diccionario RANGOS_PLANTAS)
-    rango = RANGOS_PLANTAS.get(nombre_clase.split('_')[0], RANGOS_PLANTAS['default'])
-    lower_leaf = np.array(rango['hoja'][0])
-    upper_leaf = np.array(rango['hoja'][1])
-    
-    # 3. Crear máscara de la hoja
-    mask_leaf = cv2.inRange(hsv, lower_leaf, upper_leaf)
-    
-    # 4. Extraer solo el histograma de HUE (16 bins) - IGUAL QUE EL NOTEBOOK
-    hist_hue = cv2.calcHist([hsv], [0], mask_leaf, [16], [0, 180])
-    
-    # Normalizar
-    total = hist_hue.sum()
-    if total > 0:
-        hist_hue /= total
-        
-    return hist_hue.flatten().reshape(1, -1) # Retorna (1, 16)
-
-
-    
 
 def extraer_histograma_hsv(
     imagen_pil: Image.Image,
@@ -285,28 +209,19 @@ def extraer_histograma_hsv(
     """
     Extrae un histograma HSV concatenado de la imagen.
 
-    Este es el mismo pipeline de features usado durante el entrenamiento
-    de clustering_scaler.pkl, clustering_pca.pkl, clustering_kmeans.pkl
-    y regresion_severidad.pkl (32 bins × 3 canales = 96 dimensiones).
-
-    Parameters
-    ----------
-    imagen_pil : PIL.Image.Image
-        Imagen RGB cargada por el usuario.
-    bins : int
-        Número de bins por canal. Debe coincidir con el valor usado en
-        el notebook de entrenamiento (default: 32).
+    Pipeline idéntico al usado en el entrenamiento de clustering_scaler.pkl,
+    clustering_pca.pkl y clustering_kmeans.pkl:
+    32 bins × 3 canales (H, S, V) = 96 dimensiones, normalización L1.
 
     Returns
     -------
-    np.ndarray de forma (1, bins * 3) normalizado a [0, 1].
+    np.ndarray de forma (1, 96).
     """
-    import cv2
     img_rgb = np.array(imagen_pil.convert("RGB"), dtype=np.uint8)
     img_hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
 
     histogramas = []
-    rangos = [(0, 180), (0, 256), (0, 256)]   # H, S, V — rangos OpenCV
+    rangos = [(0, 180), (0, 256), (0, 256)]  # H, S, V — rangos OpenCV
     for canal, (rng_min, rng_max) in enumerate(rangos):
         hist = cv2.calcHist(
             [img_hsv], [canal], None, [bins], [rng_min, rng_max]
@@ -314,34 +229,69 @@ def extraer_histograma_hsv(
         hist = hist.flatten().astype(np.float32)
         total = hist.sum()
         if total > 0:
-            hist /= total   # normalización L1
+            hist /= total  # normalización L1
         histogramas.append(hist)
 
-    features = np.concatenate(histogramas).reshape(1, -1)  # (1, 96)
-    return features
+    return np.concatenate(histogramas).reshape(1, -1)  # (1, 96)
+
+
+def extraer_features_regresion(imagen_pil: Image.Image, nombre_clase: str) -> np.ndarray:
+    """
+    Extrae 16 features HSV específicas para el modelo de regresión.
+
+    Pipeline: máscara de hoja por rango HSV → histograma de Hue (16 bins)
+    → normalización L1. Idéntico al pipeline del notebook de regresión.
+
+    Returns
+    -------
+    np.ndarray de forma (1, 16).
+    """
+    img_rgb = np.array(imagen_pil.convert("RGB"))
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    planta = nombre_clase.split('_')[0] if '_' in nombre_clase else nombre_clase.split(' ')[0]
+    rango = RANGOS_PLANTAS.get(planta, RANGOS_PLANTAS['default'])
+
+    lower_leaf = np.array(rango['hoja'][0])
+    upper_leaf = np.array(rango['hoja'][1])
+    mask_leaf  = cv2.inRange(hsv, lower_leaf, upper_leaf)
+
+    hist_hue = cv2.calcHist([hsv], [0], mask_leaf, [16], [0, 180])
+    total = hist_hue.sum()
+    if total > 0:
+        hist_hue /= total
+
+    return hist_hue.flatten().reshape(1, -1)  # (1, 16)
+
+
+# ---------------------------------------------------------------------------
+# Resolución de nombres de clase CNN
+# ---------------------------------------------------------------------------
 
 PLANTVILLAGE_CLASES = [
-    "Pepper bell — Bacterial spot",       # 0
-    "Pepper bell — Healthy",              # 1
-    "Potato — Early blight",              # 2
-    "Potato — Late blight",               # 3
-    "Potato — Healthy",                   # 4
-    "Tomato — Bacterial spot",            # 5
-    "Tomato — Early blight",              # 6
-    "Tomato — Late blight",               # 7
-    "Tomato — Leaf mold",                 # 8
-    "Tomato — Septoria leaf spot",        # 9
-    "Tomato — Spider mites",              # 10
-    "Tomato — Target spot",               # 11
-    "Tomato — Yellow leaf curl virus",    # 12
-    "Tomato — Mosaic virus",              # 13
-    "Tomato — Healthy",                   # 14
+    "Pepper bell — Bacterial spot",
+    "Pepper bell — Healthy",
+    "Potato — Early blight",
+    "Potato — Late blight",
+    "Potato — Healthy",
+    "Tomato — Bacterial spot",
+    "Tomato — Early blight",
+    "Tomato — Late blight",
+    "Tomato — Leaf mold",
+    "Tomato — Septoria leaf spot",
+    "Tomato — Spider mites",
+    "Tomato — Target spot",
+    "Tomato — Yellow leaf curl virus",
+    "Tomato — Mosaic virus",
+    "Tomato — Healthy",
 ]
+
 
 def _resolver_class_names(metadata: dict, n_clases: int) -> list:
     """
-    Intenta extraer nombres de clases desde el diccionario metadata.
-    Prueba múltiples claves posibles antes de usar el fallback canónico.
+    Extrae nombres de clases desde metadata.
+    Prueba múltiples claves antes de usar el fallback canónico PlantVillage.
     """
     for clave in ("class_names", "classes", "labels", "label_names",
                   "class_labels", "idx_to_class", "names"):
@@ -354,71 +304,48 @@ def _resolver_class_names(metadata: dict, n_clases: int) -> list:
                     return [val[i] for i in range(n_clases)]
                 except KeyError:
                     pass
-    # Fallback: nombres canónicos PlantVillage si el conteo coincide
     if n_clases == len(PLANTVILLAGE_CLASES):
         return PLANTVILLAGE_CLASES
-    # Último recurso: etiquetas numéricas
     return [f"Clase {i}" for i in range(n_clases)]
 
+
 # ---------------------------------------------------------------------------
-# Funciones de inferencia por módulo
+# Funciones de inferencia
 # ---------------------------------------------------------------------------
+
 def inferir_clasificacion(cnn, tensor: np.ndarray, metadata: dict) -> dict:
     """
     Ejecuta la clasificación CNN y devuelve etiqueta, confianza y top-5.
-
-    Parameters
-    ----------
-    cnn : keras.Model
-        Modelo de clasificación completo.
-    tensor : np.ndarray
-        Imagen preprocesada (1, 224, 224, 3).
-    metadata : dict
-        Diccionario con clave 'class_names': list[str].
 
     Returns
     -------
     dict con claves: etiqueta, confianza, top5
     """
-    probs = cnn.predict(tensor, verbose=0)[0]
+    probs      = cnn.predict(tensor, verbose=0)[0]
     class_names = _resolver_class_names(metadata, len(probs))
 
     idx_top   = int(np.argmax(probs))
     confianza = float(probs[idx_top])
-
     top5_idx  = np.argsort(probs)[::-1][:5]
     top5      = [(class_names[i], float(probs[i])) for i in top5_idx]
 
-    return {
-        "etiqueta":  class_names[idx_top],
-        "confianza": confianza,
-        "top5":      top5,
-    }
+    return {"etiqueta": class_names[idx_top], "confianza": confianza, "top5": top5}
 
 
 def inferir_clustering(imagen_pil: Image.Image, scaler, pca, kmeans) -> dict:
     """
-    Extrae histograma HSV, aplica la pipeline de clustering y asigna cluster.
+    Extrae histograma HSV (96 dims), aplica la pipeline de clustering
+    y devuelve el cluster asignado.
 
-    El clustering_scaler.pkl y clustering_pca.pkl fueron entrenados sobre
-    histogramas HSV (32 bins × 3 canales = 96 dimensiones), no sobre
-    features CNN. Se usa extraer_histograma_hsv() para mantener consistencia
-    con el espacio de features del entrenamiento.
-
-    Parameters
-    ----------
-    imagen_pil : PIL.Image.Image
-        Imagen original cargada por el usuario.
-    scaler, pca, kmeans : sklearn artifacts
-        Pipeline de normalización → reducción → agrupamiento.
+    Pipeline: HSV hist (96) → StandardScaler → PCA (50) → K-Means → cluster_id
 
     Returns
     -------
-    dict con claves: cluster_id, n_clusters, features_pca (np.ndarray 2-D)
+    dict con claves: cluster_id, n_clusters, features_pca
     """
-    features   = extraer_histograma_hsv(imagen_pil)           # (1, 96)
-    f_scaled   = scaler.transform(features)                   # (1, 96)
-    f_pca      = pca.transform(f_scaled)                      # (1, n_components)
+    features   = extraer_histograma_hsv(imagen_pil)   # (1, 96)
+    f_scaled   = scaler.transform(features)            # (1, 96)
+    f_pca      = pca.transform(f_scaled)               # (1, 50)
     cluster_id = int(kmeans.predict(f_pca)[0])
 
     return {
@@ -432,71 +359,56 @@ def inferir_regresion(imagen_pil: Image.Image, scaler, pca, regresor) -> dict:
     """
     Estima la severidad de la enfermedad.
 
-    Pipeline: HSV (96) → StandardScaler → PCA → slice(n_reg) → RandomForest
-
-    El PCA de clustering tiene n_components=50. El RandomForestRegressor de Max
-    fue entrenado con n_features_in_ componentes PCA (valor leído en tiempo de
-    ejecución desde regresor.n_features_in_). Dado que PCA ordena los vectores
-    propios por varianza explicada descendente, tomar los primeros n_reg
-    componentes preserva la mayor parte de la información y mantiene la
-    compatibilidad dimensional sin requerir un artefacto adicional.
-
-    Parameters
-    ----------
-    imagen_pil : PIL.Image.Image
-        Imagen original cargada por el usuario.
-    scaler : sklearn.StandardScaler
-        Normalizador ajustado sobre los 96 features HSV.
-    pca : sklearn.PCA
-        Reductor ajustado con n_components=50 (clustering).
-    regresor : sklearn estimator
-        RandomForestRegressor; su atributo n_features_in_ define cuántos
-        componentes PCA se le deben suministrar.
+    Pipeline: HSV (96) → StandardScaler → PCA → slice(n_reg) → regresor
 
     Returns
     -------
-    dict con claves: severidad (float en [0, 1]), porcentaje (float en [0, 100])
+    dict con claves: severidad (float [0,1]), porcentaje (float [0,100])
     """
     import pandas as pd
 
-    features  = extraer_histograma_hsv(imagen_pil)            # (1, 96)
-    f_scaled  = scaler.transform(features)                    # (1, 96)
-    f_pca     = pca.transform(f_scaled)                       # (1, 50)
+    features = extraer_histograma_hsv(imagen_pil)
+    f_scaled = scaler.transform(features)
+    f_pca    = pca.transform(f_scaled)
 
-    # Determinar cuántos componentes espera el regresor y adaptar.
     n_reg = getattr(regresor, "n_features_in_", f_pca.shape[1])
-    f_reg = f_pca[:, :n_reg]                                  # (1, n_reg)
+    f_reg = f_pca[:, :n_reg]
 
-    # Si el regresor fue entrenado con un DataFrame de pandas (feature names),
-    # encapsular en DataFrame para suprimir el UserWarning y garantizar
-    # compatibilidad con versiones futuras de scikit-learn.
     feature_names = getattr(regresor, "feature_names_in_", None)
     if feature_names is not None:
         f_reg = pd.DataFrame(f_reg, columns=feature_names[:n_reg])
 
-    severidad = float(regresor.predict(f_reg)[0])
-    severidad = float(np.clip(severidad, 0.0, 1.0))
+    severidad = float(np.clip(regresor.predict(f_reg)[0], 0.0, 1.0))
 
-    return {
-        "severidad":   severidad,
-        "porcentaje":  round(severidad * 100, 2),
-    }
+    return {"severidad": severidad, "porcentaje": round(severidad * 100, 2)}
 
 
 # ---------------------------------------------------------------------------
 # Utilidades de presentación
 # ---------------------------------------------------------------------------
-def descripcion_cluster(cluster_id: int, n_clusters: int) -> str:
-    """Devuelve una descripción neutral del cluster asignado."""
-    return (
-        f"Grupo visual {cluster_id + 1} de {n_clusters} "
-        "(patrón identificado por K-Means)"
-    )
 
-
-def nivel_severidad(porcentaje: float) -> tuple[str, str]:
+def descripcion_cluster(cluster_id: int, cluster_semantica: dict) -> tuple:
     """
-    Devuelve nivel textual y color Streamlit según el porcentaje de severidad.
+    Devuelve (etiqueta, descripcion) desde el mapeo semántico generado en NB4.
+
+    Returns
+    -------
+    tuple (etiqueta: str, descripcion: str)
+    """
+    entrada = cluster_semantica.get(cluster_id)
+    if entrada:
+        proporcion = entrada["proporcion_dominante"] * 100
+        return (
+            entrada["etiqueta"],
+            f"{entrada['descripcion']} "
+            f"(patrón predominante en {proporcion:.0f}% del grupo)",
+        )
+    return f"Grupo {cluster_id + 1}", "Patrón visual identificado por K-Means."
+
+
+def nivel_severidad(porcentaje: float) -> tuple:
+    """
+    Devuelve nivel textual y clave de color Streamlit según el porcentaje.
 
     Returns
     -------
@@ -532,14 +444,14 @@ if pagina == "Diagnóstico":
 
     st.title("Sistema de Detección de Enfermedades en Cultivos")
     st.markdown(
-        "Carga una imagen de hoja de **tomate**, **papa** o **pimiento** "
+        "Carga una imagen de hoja de **jitomate**, **papa** o **pimiento** "
         "para obtener el diagnóstico integrado de los tres modelos."
     )
     st.markdown("---")
 
     # Carga de modelos
     try:
-        cnn, extractor, metadata, kmeans, pca, scaler, regresor = cargar_modelos()
+        cnn, extractor, metadata, kmeans, pca, scaler, regresor, cluster_semantica = cargar_modelos()
         modelos_disponibles = True
     except Exception as exc:
         st.error(f"Error al cargar los modelos: {exc}")
@@ -557,10 +469,9 @@ if pagina == "Diagnóstico":
 
     if imagen_cargada is not None and modelos_disponibles:
 
-        imagen = Image.open(imagen_cargada).convert("RGB")
-        # Usar el tamaño de entrada real del modelo (inferido en cargar_modelos)
+        imagen    = Image.open(imagen_cargada).convert("RGB")
         _model_hw = getattr(extractor, "_rootkit_input_hw", IMG_SIZE)
-        tensor = preprocesar_imagen(imagen, img_size=_model_hw)
+        tensor    = preprocesar_imagen(imagen, img_size=_model_hw)
 
         col1, col2 = st.columns([1, 2])
 
@@ -604,19 +515,19 @@ if pagina == "Diagnóstico":
             with tab_clu:
                 with st.spinner("Ejecutando agrupamiento..."):
                     try:
-                        res_clu = inferir_clustering(
-                            imagen, scaler, pca, kmeans
+                        res_clu = inferir_clustering(imagen, scaler, pca, kmeans)
+
+                        etiqueta_cluster, desc_cluster = descripcion_cluster(
+                            res_clu["cluster_id"], cluster_semantica
                         )
 
-                        st.metric(
-                            label="Cluster asignado",
-                            value=f"Cluster {res_clu['cluster_id'] + 1}",
-                        )
+                        # Referencia explícita al diagnóstico autoritativo (CNN)
                         st.info(
-                            descripcion_cluster(
-                                res_clu["cluster_id"],
-                                res_clu["n_clusters"],
-                            )
+                            f"El diagnóstico de referencia es: "
+                            f"**{res_clf['etiqueta']}** "
+                            f"(CNN · confianza {res_clf['confianza']*100:.1f} %). "
+                            "Las imágenes a continuación corresponden al grupo con "
+                            "mayor similitud visual en espacio de color HSV."
                         )
 
                         # Imágenes representativas del cluster
@@ -628,15 +539,13 @@ if pagina == "Diagnóstico":
                                 os.listdir(carpeta_cluster)
                             )[:4]
                             if imagenes_similares:
-                                st.markdown("**Imágenes similares del cluster**")
+                                st.markdown("**Casos con patrón visual similar**")
                                 cols = st.columns(4)
                                 for col, nombre_img in zip(cols, imagenes_similares):
-                                    ruta_img = os.path.join(
-                                        carpeta_cluster, nombre_img
-                                    )
+                                    ruta_img = os.path.join(carpeta_cluster, nombre_img)
                                     col.image(
                                         Image.open(ruta_img),
-                                        width="stretch",
+                                        use_container_width=True,
                                         caption="Caso similar",
                                     )
 
@@ -649,37 +558,30 @@ if pagina == "Diagnóstico":
             with tab_reg:
                 with st.spinner("Estimando severidad..."):
                     try:
-                        # 1. USAMOS LA ETIQUETA QUE DIO LA CLASIFICACIÓN (RES_CLF VIENE DEL TAB 1)
-                        clase_actual = res_clf["etiqueta"]
-            
-                        # 2. LLAMAMOS A TU NUEVA FUNCIÓN (LA QUE PUSISTE ARRIBA)
-                        # Esto genera 16 features. NO USAMOS NI SCALER NI PCA AQUÍ.
-                        features_hsv = extraer_features_regresion(imagen, clase_actual)
-            
-                        # 3. PREDICCIÓN DIRECTA CON TU MODELO .PKL
-                        # Como tu modelo espera 16 y le damos 16, ya no habrá error.
+                        clase_actual       = res_clf["etiqueta"]
+                        features_hsv       = extraer_features_regresion(imagen, clase_actual)
                         porcentaje_predicho = regresor.predict(features_hsv)[0]
-            
-                        # 4. OBTENER NIVEL TEXTUAL (BAJO, ALTO, ETC.)
+
                         nivel, color_str = nivel_severidad(porcentaje_predicho)
-            
-                        # 5. MOSTRAR RESULTADOS
+
                         st.metric(
                             label="Severidad estimada",
                             value=f"{porcentaje_predicho:.2f} %",
                             delta=f"Nivel: {nivel}",
                         )
-            
-                        # Barra de progreso
-                        st.progress(min(porcentaje_predicho/100, 1.0), text=f"Afectación: {porcentaje_predicho:.1f}%")
-            
+
+                        st.progress(
+                            min(porcentaje_predicho / 100, 1.0),
+                            text=f"Afectación: {porcentaje_predicho:.1f} %",
+                        )
+
                         if color_str == "success":
                             st.success("Nivel bajo. Monitoreo preventivo.")
                         elif color_str == "warning":
                             st.warning("Nivel moderado. Aplicar tratamiento.")
                         else:
                             st.error("Nivel crítico. Intervención inmediata.")
-            
+
                     except Exception as exc:
                         st.error(f"Error en regresión: {exc}")
 
@@ -700,29 +602,29 @@ elif pagina == "Acerca del proyecto":
     ### Modelos implementados
     | Módulo | Algoritmo | Responsable | Artefacto |
     |---|---|---|---|
-    | Clasificación | CNN (MobileNetV2) | Carlos | `cnn_v1.h5` |
+    | Clasificación | CNN (MobileNetV2) | Carlos | `best_cnn_v1.h5` |
     | Agrupamiento | K-Means + PCA | Othon | `clustering_kmeans.pkl` |
-    | Regresión de severidad | Regresión sobre features CNN | Max | `regresion_severidad.pkl` |
+    | Regresión de severidad | Random Forest sobre features HSV | Max | `regresion_severidad.pkl` |
 
     ### Dataset
-    PlantVillage — 15 clases (tomate, papa, pimiento)
+    PlantVillage — 15 clases (jitomate, papa, pimiento)
 
     ### Stack tecnológico
     Python 3.10 · TensorFlow / Keras · scikit-learn · Streamlit · Google Colab · GitHub
 
     ### Arquitectura del pipeline de inferencia
     ```
-    Imagen (224×224 RGB)
+    Imagen RGB
          │
          ▼
-    Preprocesamiento (normalización [0,1])
+    Preprocesamiento (resize + normalización [0, 1])
          │
-         ├──► CNN completo ──────────────► Clasificación (15 clases)
+         ├──► CNN completo ──────────────────────► Clasificación (15 clases)
          │
-         └──► CNN extractor (features)
+         └──► Histograma HSV (32 bins × 3 = 96)
                    │
-                   ├──► StandardScaler ──► PCA ──► K-Means ──► Cluster ID
+                   ├──► StandardScaler → PCA (50) → K-Means ──► Grupo visual
                    │
-                   └──► StandardScaler ──► Regresor ──────────► Severidad (%)
+                   └──► Máscara HSV → Hue hist (16) → Regresor ─► Severidad (%)
     ```
     """)
